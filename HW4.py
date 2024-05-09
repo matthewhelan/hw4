@@ -168,25 +168,25 @@ def train_TD3():
     if len(replay_buffer) < BATCH_SIZE:
         return
     
-    transitions = replay_buffer.sample(BATCH_SIZE)
-    batch = list(zip(*transitions))
-    states = torch.tensor(batch[0], dtype=torch.float32)
-    actions = torch.tensor(batch[1], dtype=torch.float32)
-    rewards = torch.tensor(batch[2], dtype=torch.float32)
-    next_states = torch.tensor(batch[3], dtype=torch.float32)
-    dones = torch.tensor(batch[4], dtype=torch.float32)
+    sample_batch = replay_buffer.sample(BATCH_SIZE)
+    s, a, r, _s, D = zip(*sample_batch)
+    state_batch = torch.stack(s)
+    action_batch = torch.stack(a)
+    reward_batch = torch.tensor(r, dtype=torch.float32)
+    _state_batch = torch.stack(_s)
+    done_batch = torch.tensor(D, dtype=torch.float32)
 
     with torch.no_grad():
-        next_actions = actor_target_net(next_states)
-        noise = (torch.randn_like(actions) * SIGMA).clamp(-0.5, 0.5)
+        next_actions = actor_target_net(_state_batch)
+        noise = (torch.randn_like(action_batch) * SIGMA).clamp(-0.5, 0.5)
         next_actions = (next_actions + noise).clamp(A_MIN, A_MAX)
         
-        target_Q1 = critic_target_net((next_states, next_actions))
-        target_Q2 = critic_target_net2((next_states, next_actions))
-        target_Q = rewards + GAMMA * (1 - dones) * torch.min(target_Q1, target_Q2)
+        target_Q1 = critic_target_net((_state_batch, next_actions))
+        target_Q2 = critic_target_net2((_state_batch, next_actions))
+        target_Q = reward_batch + GAMMA * (1 - done_batch) * torch.min(target_Q1, target_Q2)
 
-    current_Q1 = critic_net((states, actions))
-    current_Q2 = critic_net2((states, actions))
+    current_Q1 = critic_net((state_batch, action_batch))
+    current_Q2 = critic_net2((state_batch, action_batch))
     critic1_loss = F.mse_loss(current_Q1, target_Q)
     critic2_loss = F.mse_loss(current_Q2, target_Q)
 
@@ -200,7 +200,7 @@ def train_TD3():
 
     # Update only if t mod n = 0
     if episode % POLICY_UPDATE_FREQ == 0:
-        actor_loss = -critic_net((states, actor_net(states))).mean()
+        actor_loss = -critic_net((state_batch, actor_net(state_batch))).mean()
         optimizer_actor.zero_grad()
         actor_loss.backward()
         optimizer_actor.step()
