@@ -25,6 +25,8 @@ LR_C = 1e-3
 LR_A = 1e-4
 TAU = 1e-3
 SIGMA = 0.02
+POLICY_UPDATE_FREQ = 5
+
 
 def plot_durations(episode_index, episode_return):
     plt.figure(1)
@@ -87,15 +89,21 @@ actor_target_net = ActorNet()
 actor_net = ActorNet()  # copy.deepcopy(actor_target_net)
 critic_target_net = CriticNet()
 critic_net = CriticNet()  # copy.deepcopy(critic_target_net)
+
+# Other two critic networks only for TD3
+critic_net2 = CriticNet()
+critic_target_net2 = CriticNet()
+
 replay_buffer = ReplayBuffer(BUFFER_SIZE)
 
 optimizer_critic = optim.Adam(critic_net.parameters(), lr=LR_C)  
+optimizer_critic2 = optim.Adam(critic_net2.parameters(), lr=LR_C)  #  second optimizer for TD3 only
 optimizer_actor = optim.Adam(actor_net.parameters(), lr=LR_A)
 
 def select_action(obs, noiseless=False):
     # TODO: pick action according to actor_net and Gaussian noise
     # If noiseless=True, do not add noise (for evaluation purpose) 
-    obs = torch.from_numpy(obs).float().unsqueeze(0)
+    # obs = torch.from_numpy(obs).float().unsqueeze(0)
     # Get action prediction
     action = actor_net(obs).detach()
 
@@ -106,12 +114,11 @@ def select_action(obs, noiseless=False):
 
     # Clamp the action to the valid action space limits and convert to numpy for the environment
     action = torch.clamp(action, A_MIN, A_MAX)
-    return action.numpy()
-
+    return torch.tensor(action, dtype=torch.float)  
     # action = np.random.normal(SIGMA, size=(Na,))
     # return torch.tensor(action, dtype=torch.float)
 
-def train():
+def train_DDPM():
     if len(replay_buffer) < BATCH_SIZE:
         return
     else:
@@ -126,11 +133,11 @@ def train():
     # TODO: calculate critic_loss and perform gradient update
     optimizer_critic.zero_grad()
     # Predict the current Q-values
-    current_Q_values = critic_net(state_batch, action_batch)
+    current_Q_values = critic_net((state_batch, action_batch))
     # Compute the next actions using the actor target network
     next_actions = actor_target_net(_state_batch)
     # Predict the next Q-values using the critic target network
-    next_Q_values = critic_target_net(_state_batch, next_actions)
+    next_Q_values = critic_target_net((_state_batch, next_actions))
     # Compute the target Q-values
     target_Q_values = reward_batch + GAMMA * next_Q_values * (1 - done_batch)
     # Compute the critic loss
@@ -144,7 +151,7 @@ def train():
     # Compute the actor loss
     predicted_actions = actor_net(state_batch)
     # Gradient ASCENT so negative loss, average loss across samples
-    actor_loss = -critic_net(state_batch, predicted_actions).mean()
+    actor_loss = -critic_net((state_batch, predicted_actions)).mean()
     # Backpropagate the loss
     actor_loss.backward()
     optimizer_actor.step()
@@ -157,13 +164,66 @@ def train():
     for target_param, param in zip(critic_target_net.parameters(), critic_net.parameters()):
         target_param.data.copy_(target_param.data * (1.0 - TAU) + param.data * TAU)
 
+def train_TD3():
+    if len(replay_buffer) < BATCH_SIZE:
+        return
+    
+    transitions = replay_buffer.sample(BATCH_SIZE)
+    batch = list(zip(*transitions))
+    states = torch.tensor(batch[0], dtype=torch.float32)
+    actions = torch.tensor(batch[1], dtype=torch.float32)
+    rewards = torch.tensor(batch[2], dtype=torch.float32)
+    next_states = torch.tensor(batch[3], dtype=torch.float32)
+    dones = torch.tensor(batch[4], dtype=torch.float32)
+
+    with torch.no_grad():
+        next_actions = actor_target_net(next_states)
+        noise = (torch.randn_like(actions) * SIGMA).clamp(-0.5, 0.5)
+        next_actions = (next_actions + noise).clamp(A_MIN, A_MAX)
+        
+        target_Q1 = critic_target_net((next_states, next_actions))
+        target_Q2 = critic_target_net2((next_states, next_actions))
+        target_Q = rewards + GAMMA * (1 - dones) * torch.min(target_Q1, target_Q2)
+
+    current_Q1 = critic_net((states, actions))
+    current_Q2 = critic_net2((states, actions))
+    critic1_loss = F.mse_loss(current_Q1, target_Q)
+    critic2_loss = F.mse_loss(current_Q2, target_Q)
+
+    optimizer_critic.zero_grad()
+    critic1_loss.backward()
+    optimizer_critic.step()
+
+    optimizer_critic2.zero_grad()
+    critic2_loss.backward()
+    optimizer_critic2.step()
+
+    # Update only if t mod n = 0
+    if episode % POLICY_UPDATE_FREQ == 0:
+        actor_loss = -critic_net((states, actor_net(states))).mean()
+        optimizer_actor.zero_grad()
+        actor_loss.backward()
+        optimizer_actor.step()
+
+        # Update target networks like DDPM
+        for target_param, param in zip(actor_target_net.parameters(), actor_net.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - TAU) + param.data * TAU)
+
+        for target_param, param in zip(critic_target_net.parameters(), critic_net.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - TAU) + param.data * TAU)
+
+        for target_param, param in zip(critic_target_net2.parameters(), critic_net2.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - TAU) + param.data * TAU)
+       
+       
+
 timer = 0
 R = 0
 Return = []
 episode_indexes = []
 
 for episode in range(EPISODE):
-    obs, _ = env.reset()
+    obs = env.reset()
     obs = torch.tensor(obs, dtype=torch.float)
     done = False
     timer = 0
@@ -173,12 +233,13 @@ for episode in range(EPISODE):
     while not done:
         action = select_action(obs, eval)
         action = torch.clamp(action, min=A_MIN, max=A_MAX)
-        obs_, reward, terminated, truncated, _ = env.step(action.numpy())
-        done = terminated or truncated
+        obs_, reward, terminated, _ = env.step(action.numpy())
+        done = terminated
         obs_ = torch.tensor(obs_, dtype=torch.float)
         transition = (obs, action, reward, obs_, done)
         replay_buffer.push(transition)
-        train()
+        # train_DDPM()
+        train_TD3()
         R += reward
         timer += 1
         obs = obs_
